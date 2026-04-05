@@ -40,6 +40,23 @@ if is_gptqmodel_available():
     from gptqmodel.utils.importer import hf_select_quant_linear_v2
 
 
+def _quant_config_value(config, key, default=None):
+    quant_config = getattr(config, "quantization_config", None)
+    if quant_config is None:
+        return default
+    if isinstance(quant_config, dict):
+        return quant_config.get(key, default)
+    return getattr(quant_config, key, default)
+
+
+def _checkpoint_format_and_meta(config):
+    if hasattr(config, "quantization_config"):
+        quant_config = config.quantization_config
+        if isinstance(quant_config, dict):
+            return quant_config.get("checkpoint_format", "gptq"), quant_config.get("meta")
+    return "gptq", None
+
+
 class GPTQConfigTest(unittest.TestCase):
     def test_bits(self):
         with self.assertRaises(ValueError):
@@ -217,7 +234,20 @@ class GPTQTest(unittest.TestCase):
         self.assertIn(self.tokenizer.decode(output_sequences[0], skip_special_tokens=True), self.EXPECTED_OUTPUTS)
 
     def check_quantized_layers_type(self, model, value):
-        self.assertEqual(model.transformer.h[0].mlp.dense_4h_to_h.QUANT_TYPE, value)
+        checkpoint_format, meta = _checkpoint_format_and_meta(model.config)
+        expected_cls = hf_select_quant_linear_v2(
+            bits=_quant_config_value(model.config, "bits", self.bits),
+            group_size=_quant_config_value(model.config, "group_size", self.group_size),
+            desc_act=_quant_config_value(model.config, "desc_act", self.desc_act),
+            sym=_quant_config_value(model.config, "sym", self.sym),
+            device_map=self.device_map,
+            format=checkpoint_format,
+            quant_method=METHOD.GPTQ,
+            meta=meta,
+            backend=value,
+            pack=True,
+        )
+        self.assertIsInstance(model.transformer.h[0].mlp.dense_4h_to_h, expected_cls)
 
     def test_generate_quality(self):
         """
@@ -238,12 +268,12 @@ class GPTQTest(unittest.TestCase):
             self.tokenizer.save_pretrained(tmpdirname)
             self.quantized_model.save_pretrained(tmpdirname)
             if self.device_map == "cpu":
-                quant_type = "torch_fused"
+                quant_backend = BACKEND.TORCH_FUSED
             else:
-                quant_type = "exllamav2"
+                quant_backend = BACKEND.EXLLAMA_V2
             quantized_model_from_saved = AutoModelForCausalLM.from_pretrained(tmpdirname, device_map=self.device_map)
 
-            self.check_quantized_layers_type(quantized_model_from_saved, quant_type)
+            self.check_quantized_layers_type(quantized_model_from_saved, quant_backend)
             self.check_inference_correctness(quantized_model_from_saved)
 
     @require_accelerate
@@ -274,8 +304,8 @@ class GPTQTestCUDA(GPTQTest):
                 device_map=self.device_map,
             )
             self.assertEqual(quantized_model_from_saved.config.quantization_config.bits, self.bits)
-            quant_type = "exllamav2" if self.device_map != "cpu" else "torch"
-            self.check_quantized_layers_type(quantized_model_from_saved, quant_type)
+            quant_backend = BACKEND.EXLLAMA_V2 if self.device_map != "cpu" else BACKEND.GPTQ_TORCH
+            self.check_quantized_layers_type(quantized_model_from_saved, quant_backend)
             self.check_inference_correctness(quantized_model_from_saved)
 
 
@@ -345,7 +375,20 @@ class GPTQTestActOrderExllamaV2(unittest.TestCase):
         self.assertIn(self.tokenizer.decode(output_sequences[0], skip_special_tokens=True), self.EXPECTED_OUTPUTS)
 
     def test_quantized_layers_type(self):
-        self.assertEqual(self.quantized_model.model.layers[0].self_attn.k_proj.QUANT_TYPE, "exllamav2")
+        checkpoint_format, meta = _checkpoint_format_and_meta(self.quantized_model.config)
+        expected_cls = hf_select_quant_linear_v2(
+            bits=_quant_config_value(self.quantized_model.config, "bits", 4),
+            group_size=_quant_config_value(self.quantized_model.config, "group_size", 128),
+            desc_act=_quant_config_value(self.quantized_model.config, "desc_act", self.desc_act),
+            sym=_quant_config_value(self.quantized_model.config, "sym", True),
+            device_map={"": 0},
+            format=checkpoint_format,
+            quant_method=METHOD.GPTQ,
+            meta=meta,
+            backend=BACKEND.EXLLAMA_V2,
+            pack=True,
+        )
+        self.assertIsInstance(self.quantized_model.model.layers[0].self_attn.k_proj, expected_cls)
 
     def test_generate_quality(self):
         """
@@ -388,10 +431,20 @@ class GPTQTestExllamaV2(unittest.TestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model_name, use_fast=True)
 
     def test_quantized_layers_type(self):
-        self.assertEqual(
-            self.quantized_model.model.layers[0].self_attn.k_proj.QUANT_TYPE,
-            "exllamav2",
+        checkpoint_format, meta = _checkpoint_format_and_meta(self.quantized_model.config)
+        expected_cls = hf_select_quant_linear_v2(
+            bits=_quant_config_value(self.quantized_model.config, "bits", 4),
+            group_size=_quant_config_value(self.quantized_model.config, "group_size", 128),
+            desc_act=_quant_config_value(self.quantized_model.config, "desc_act", False),
+            sym=_quant_config_value(self.quantized_model.config, "sym", True),
+            device_map={"": 0},
+            format=checkpoint_format,
+            quant_method=METHOD.GPTQ,
+            meta=meta,
+            backend=BACKEND.EXLLAMA_V2,
+            pack=True,
         )
+        self.assertIsInstance(self.quantized_model.model.layers[0].self_attn.k_proj, expected_cls)
 
     def check_inference_correctness(self, model):
         """
